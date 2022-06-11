@@ -1,4 +1,4 @@
-module github.com/T-Systems-MMS/vault-ocsp
+module github.com/mponton/vault-ocsp
 
 go 1.15
 

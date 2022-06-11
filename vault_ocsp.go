@@ -29,6 +29,7 @@ import (
 )
 
 func main() {
+	var autoMount = flag.Uint("automount", 0, "if present, PKI mount will be extracted from request URL using the number of levels specified")
 	var pkiMount = flag.String("pkimount", "pki", "vault PKI mount to use")
 	var serverAddr = flag.String("serverAddr", ":8080", "Server IP and Port to use")
 	var responderCertFile = flag.String("responderCert", "", "OCSP responder signing certificate file")
@@ -53,13 +54,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	vaultSource, err := NewVaultSource(*pkiMount, responderCert, &responderKey, nil)
-	if err != nil {
-		log.Criticalf("vault source initialization failed: %v", err)
-		os.Exit(1)
+	if *autoMount == 0 {
+		// Original (default) behavior with single PKI mount
+		vaultSource, err := NewVaultSource(*pkiMount, responderCert, &responderKey, nil)
+		if err != nil {
+			log.Criticalf("vault source initialization failed: %v", err)
+			os.Exit(1)
+		}
+		http.Handle("/", cfocsp.NewResponder(vaultSource, nil))
+	} else {
+		// Use AutoVaultResponder shim to handle OCSP requests for different PKI mount points
+		http.Handle("/", NewAutoVaultResponder(*autoMount, responderCert, &responderKey))
 	}
-
-	http.Handle("/", cfocsp.NewResponder(vaultSource, nil))
 
 	server := &http.Server{
 		Addr: *serverAddr,
@@ -68,6 +74,79 @@ func main() {
 		log.Criticalf("ListenAndServe failed: %v", err)
 	}
 }
+
+type AutoVaultResponder struct {
+	levels        uint
+	responders    map[string]*cfocsp.Responder
+	responderCert *x509.Certificate
+	responderKey  *crypto.Signer
+}
+
+func NewAutoVaultResponder(levels uint, responderCert *x509.Certificate, responderKey *crypto.Signer) *AutoVaultResponder {
+	return &AutoVaultResponder{
+		levels:        levels,
+		responders:    make(map[string]*cfocsp.Responder),
+		responderCert: responderCert,
+		responderKey:  responderKey,
+	}
+}
+
+func (r AutoVaultResponder) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	log.Infof("Incoming %s request on: %s", request.Method, request.URL.Path)
+
+	// Basic fail-early sanity checks
+	var parts = strings.Split(strings.Trim(request.URL.Path, "/"), "/")
+	switch request.Method {
+	case "GET":
+		// On GET requests we expect to have "parts" > levels as the data is sent
+		// in base64 form via the path itself.
+		if len(parts) <= int(r.levels) {
+			log.Errorf("not enough parts (%d) in URL path to fulfill GET request with %d level(s) for PKI mount", len(parts), r.levels)
+			response.WriteHeader(http.StatusNotFound)
+			return
+		}
+	case "POST":
+		// On POST requests we should have the same exact amount of "parts" from
+		// the path as the ones we expect.
+		if len(parts) != int(r.levels) {
+			log.Errorf("unexpected number of parts (%d) in URL path to fulfill POST request with %d level(s) for PKI mount", len(parts), r.levels)
+			response.WriteHeader(http.StatusNotFound)
+			return
+		}
+	default:
+		response.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var pkiMount = strings.Join(parts[:r.levels], "/")
+	request.URL.Path = strings.Join(parts[r.levels:], "/")
+	log.Debugf("Extracted this PKI mount using %d levels from the request path: %s", r.levels, pkiMount)
+	log.Debugf("Final request path for OCSP responder is: %s", request.URL.Path)
+
+	var responder = r.responders[pkiMount]
+
+	if responder == nil {
+		// Setup a new VaultSource for this path
+		log.Debugf("Creating Vault source for PKI mount '%s'", pkiMount)
+		vaultSource, err := NewVaultSource(pkiMount, r.responderCert, r.responderKey, nil)
+		if err != nil {
+			log.Errorf("vault source initialization failed for mount '%s': %v", pkiMount, err)
+		} else {
+			log.Debugf("Successfully created Vault source for PKI mount '%s', now creating mount-specific OCSP responder", pkiMount)
+			responder = cfocsp.NewResponder(vaultSource, nil)
+			r.responders[pkiMount] = responder
+		}
+	}
+	if responder != nil {
+		// Call the responder to do the actual work
+		log.Debugf("Delegating work to mount-specific OCSP responder")
+		responder.ServeHTTP(response, request)
+		return
+	}
+	// Invalid request path
+	response.WriteHeader(http.StatusNotFound)
+}
+
 func parseResponderKey(responderKeyFile string) (responderKey crypto.Signer, err error) {
 	pemBytes, err := ioutil.ReadFile(responderKeyFile)
 	if err != nil {
@@ -165,7 +244,7 @@ func (source VaultSource) Response(request *ocsp.Request) ([]byte, http.Header, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("error building CA certificate hash with algorithm %d: %v", request.HashAlgorithm, err)
 	}
-	if bytes.Compare(request.IssuerKeyHash, caHash) != 0 {
+	if !bytes.Equal(request.IssuerKeyHash, caHash) {
 		return nil, nil, errors.New("request issuer key has does not match CA subject key hash")
 	}
 
