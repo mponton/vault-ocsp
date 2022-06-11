@@ -1,3 +1,5 @@
 .idea/
+.vscode/
 *.pem
 vault-ocsp
+vault-ocsp.exe
